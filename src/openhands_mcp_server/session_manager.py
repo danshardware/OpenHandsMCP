@@ -16,6 +16,8 @@ from docker.errors import DockerException
 from git.exc import GitCommandError
 from pydantic import BaseModel
 
+OPENHANDS_VERSION = os.environ.get("OPENHANDS_VERSION", "0.45")
+OPENHANDS_SANDBOX_VERSION = os.environ.get("OPENHANDS_SANDBOX_VERSION", f"docker.all-hands.dev/all-hands-ai/runtime:${OPENHANDS_VERSION}-nikolaik")
 
 class SessionInfo(BaseModel):
     """Information about a coding session."""
@@ -164,11 +166,11 @@ class SessionManager:
             
             # Run OpenHands container
             container = self.docker_client.containers.run(
-                "ghcr.io/all-hands-ai/openhands:main",
+                f"docker.all-hands.dev/all-hands-ai/openhands:${OPENHANDS_VERSION}",
+                command=["python", "-m", "openhands.core.main", "-t", task_description],
                 name=container_name,
                 volumes=volumes,
                 environment=environment,
-                working_dir="/workspace",
                 detach=True,
                 remove=True,
                 auto_remove=True
@@ -177,7 +179,7 @@ class SessionManager:
             session.container_id = container.id
             
             # Wait for container to complete and get logs
-            print(f"Starting OpenHands coding session for task: {task_description}")
+            print(f"Starting OpenHands coding session for branch: {session.branch}")
             container.wait()
             
             logs = container.logs(stdout=True, stderr=True).decode('utf-8')
