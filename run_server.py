@@ -52,7 +52,7 @@ if __name__ == "__main__":
     print("Press Ctrl+C to stop the server.")
     
     try:
-        asyncio.run(main())
+        main()
     except KeyboardInterrupt:
         print("\nServer stopped by user.")
     except Exception as e:
