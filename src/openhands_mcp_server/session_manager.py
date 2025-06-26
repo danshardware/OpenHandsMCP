@@ -16,6 +16,10 @@ from docker.errors import DockerException
 from git.exc import GitCommandError
 from pydantic import BaseModel
 
+import logging
+# Set up logging
+logger = logging.getLogger("openhands-mcp-server")
+
 OPENHANDS_VERSION = os.environ.get("OPENHANDS_VERSION", "0.45")
 OPENHANDS_SANDBOX_VERSION = os.environ.get("OPENHANDS_SANDBOX_VERSION", f"docker.all-hands.dev/all-hands-ai/runtime:${OPENHANDS_VERSION}-nikolaik")
 
@@ -34,6 +38,40 @@ class SessionInfo(BaseModel):
 class SessionManager:
     """Manages OpenHands coding sessions."""
     
+    def import_existing_session(self, session_id: str):
+        """Import an existing session from the sessions directory, updating or creating the SessionInfo."""
+        session_path = self.sessions_dir / session_id
+        if not session_path.exists() or not session_path.is_dir():
+            logger.warning(f"Session directory {session_path} does not exist.")
+            return
+        try:
+            repo = git.Repo(session_path)
+            branch = repo.active_branch.name
+            repo_url = next(repo.remote().urls)
+        except Exception as e:
+            logger.error(f"Failed to import session {session_id}: {e}")
+            return
+        created_at = datetime.fromtimestamp(session_path.stat().st_mtime)
+        session_info = SessionInfo(
+            session_id=session_id,
+            repo_url=repo_url,
+            branch=branch,
+            workspace_path=session_path,
+            created_at=created_at
+        )
+        self.sessions[session_id] = session_info
+        logger.info(f"Imported session {session_id} from {session_path}")
+
+    def _import_all_existing_sessions(self):
+        """Scan the sessions directory and import all valid session folders."""
+        for entry in self.sessions_dir.iterdir():
+            if entry.is_dir():
+                try:
+                    uuid.UUID(entry.name)
+                    self.import_existing_session(entry.name)
+                except ValueError:
+                    continue
+
     def __init__(self, sessions_dir: str = "./sessions", archive_dir: str = "./archive"):
         self.sessions_dir = Path(sessions_dir)
         self.archive_dir = Path(archive_dir)
@@ -48,8 +86,15 @@ class SessionManager:
         try:
             self.docker_client = docker.from_env()
         except DockerException as e:
-            print(f"Warning: Could not connect to Docker: {e}")
+            logger.warning(f"Could not connect to Docker: {e}")
             self.docker_client = None
+        try:
+            self._import_all_existing_sessions()
+            logger.info(f"Imported {len(self.sessions)} existing sessions from {self.sessions_dir}")
+        except Exception as e:
+            logger.warning(f"Failed to import existing sessions: {e}")
+            # Continue without existing sessions if import fails
+            self.sessions = {}
     
     def create_session(self, repo_url: str, branch: str = "main") -> str:
         """Create a new coding session."""
@@ -61,7 +106,7 @@ class SessionManager:
             workspace_path.mkdir(exist_ok=True)
             
             # Clone repository
-            print(f"Cloning repository {repo_url}...")
+            logger.info(f"Cloning repository {repo_url}...")
             repo = git.Repo.clone_from(repo_url, workspace_path)
             
             # Checkout branch
@@ -74,7 +119,7 @@ class SessionManager:
                 except GitCommandError:
                     # If that fails, stick with current branch
                     current_branch = repo.active_branch.name
-                    print(f"Could not checkout/create branch '{branch}', using '{current_branch}'")
+                    logger.warning(f"Could not checkout/create branch '{branch}', using '{current_branch}'")
                     branch = current_branch
             
             # Create session info
@@ -88,7 +133,7 @@ class SessionManager:
             
             self.sessions[session_id] = session_info
             
-            print(f"Session {session_id} created successfully")
+            logger.info(f"Session {session_id} created successfully")
             return session_id
             
         except Exception as e:
@@ -128,8 +173,14 @@ class SessionManager:
             # Execute the git command
             output = getattr(repo.git, git_cmd)(*git_args)
             
+            logger.debug(f"Executed git command '{command}' in session {session_id}: {output}")
+            
+            # Update the session status
+            self.import_existing_session(session_id)
+            
             return {
                 "success": True,
+                "isError": False,
                 "output": output,
                 "error": None
             }
@@ -137,6 +188,7 @@ class SessionManager:
         except GitCommandError as e:
             return {
                 "success": False,
+                "isError": True,
                 "output": e.stdout if e.stdout else "",
                 "error": e.stderr if e.stderr else str(e)
             }
@@ -195,24 +247,38 @@ class SessionManager:
                 "python", "-m", "openhands.core.main", "-t", task_description
             ]
 
-            container = self.docker_client.containers.run(
-                openhands_image,
-                command=command,
-                name=container_name,
-                volumes=volumes,
-                environment=environment,
-                extra_hosts=extra_hosts,
-                detach=True,
-                remove=True,
-                auto_remove=True
-            )
+            logger.info(f"Starting OpenHands coding session on container: {container_name}")
+            try:
+                container = self.docker_client.containers.run(
+                    openhands_image,
+                    command=command,
+                    name=container_name,
+                    volumes=volumes,
+                    environment=environment,
+                    extra_hosts=extra_hosts,
+                    detach=True,
+                    remove=True,
+                    auto_remove=True
+                )
+            except Exception as e:
+                logger.error(
+                    f"Failed to start container.\n"
+                    f"Image: {openhands_image}\n"
+                    f"Command: {command}\n"
+                    f"Name: {container_name}\n"
+                    f"Volumes: {volumes}\n"
+                    f"Environment: {environment}\n"
+                    f"Extra hosts: {extra_hosts}\n"
+                    f"Error: {e}"
+                )
+                raise
 
             session.container_id = container.id
 
             print(f"Starting OpenHands coding session for branch: {session.branch}")
             container.wait()
             logs = container.logs(stdout=True, stderr=True).decode('utf-8')
-            session.status = "completed"
+            session.status = "ok"
             return logs
 
         except DockerException as e:

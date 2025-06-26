@@ -50,15 +50,17 @@ async def code(session_id: str, task_description: str) -> dict:
     if not session_manager.session_exists(session_id):
         return {
             "success": False,
+            "isError": True,
             "error": "Session not found",
             "session_id": session_id
         }
     logs = await session_manager.start_coding_session(session_id, task_description)
     return {
         "success": True,
+        "isError": False,
         "session_id": session_id,
         "task_description": task_description,
-        "conversation_log": logs
+        "text": logs
     }
 
 @mcp.tool()
