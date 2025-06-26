@@ -46,7 +46,13 @@ def start_session(repo_url: str, branch: str = "main") -> dict:
 
 @mcp.tool()
 async def code(session_id: str, task_description: str) -> dict:
-    """Start a coding session with OpenHands AI agent."""
+    """Start a coding session with OpenHands AI agent. Use this tool for any commands that require executing any commands in the session workspace."""
+    if not session_manager.session_exists(session_id):
+        return {
+            "success": False,
+            "error": "Session not found",
+            "session_id": session_id
+        }
     logs = await session_manager.start_coding_session(session_id, task_description)
     return {
         "success": True,

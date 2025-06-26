@@ -97,6 +97,10 @@ class SessionManager:
                 shutil.rmtree(workspace_path)
             raise RuntimeError(f"Failed to create session: {e}")
     
+    def session_exists(self, session_id: str) -> bool:
+        """Check if a session with the given session_id exists."""
+        return session_id in self.sessions
+    
     def get_session(self, session_id: str) -> SessionInfo:
         """Get session information."""
         if session_id not in self.sessions:
@@ -112,6 +116,12 @@ class SessionManager:
             
             # Use getattr to call git commands dynamically
             command_parts = command.split()
+            if command_parts[0] == "git":
+                command_parts = command_parts[1:]
+            
+            allowed_commands = ["add", "commit", "push", "pull", "status", "checkout", "branch", "log", "diff"]
+            if command_parts[0] not in allowed_commands:
+                raise ValueError(f"Command '{command_parts[0]}' is not allowed in this context. Allowed commands: {', '.join(allowed_commands)}")
             git_cmd = command_parts[0]
             git_args = command_parts[1:] if len(command_parts) > 1 else []
             
@@ -138,57 +148,73 @@ class SessionManager:
             }
     
     async def start_coding_session(self, session_id: str, task_description: str) -> str:
-        """Start an OpenHands coding session."""
+        """Start an OpenHands coding session"""
         session = self.get_session(session_id)
-        
+
         if not self.docker_client:
             raise RuntimeError("Docker client not available")
-        
+
         try:
-            # Prepare Docker environment
-            container_name = f"openhands-{session_id}"
-            
-            # Mount the workspace directory
+            container_name = f"openhands-app-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+            user_home = str(Path.home())
+            # Try to get podman/docker socket path (Linux/WSL/Podman Desktop)
+            xdg_runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+            podman_sock = None
+            if xdg_runtime_dir:
+                podman_sock = os.path.join(xdg_runtime_dir, "podman/podman.sock")
+            else:
+                # Fallback for Windows/Mac: use default Docker socket
+                podman_sock = os.environ.get("DOCKER_HOST", "/var/run/docker.sock")
+
+            openhands_ver = os.environ.get("OPENHANDS_VER", "0.45")
+            runtime_image = f"docker.all-hands.dev/all-hands-ai/runtime:{openhands_ver}-nikolaik"
+            openhands_image = f"docker.all-hands.dev/all-hands-ai/openhands:{openhands_ver}"
+
             volumes = {
-                str(session.workspace_path.absolute()): {
-                    'bind': '/workspace',
-                    'mode': 'rw'
-                }
+                str(session.workspace_path.absolute()): {'bind': '/workspace', 'mode': 'rw'},
+                podman_sock: {'bind': '/var/run/docker.sock', 'mode': 'rw'},
+                os.path.join(user_home, ".openhands"): {'bind': '/.openhands', 'mode': 'rw'},
             }
-            
-            # Environment variables for OpenHands
+
             environment = {
+                'SANDBOX_RUNTIME_CONTAINER_IMAGE': runtime_image,
+                'SANDBOX_VOLUMES': f"{session.workspace_path.absolute()}: /workspace",
+                'LLM_API_KEY': 'ollama',
+                'LLM_MODEL': 'ollama/devstral:latest',
+                'LOG_ALL_EVENTS': 'true',
+                'LLM_BASE_URL': 'http://host.docker.internal:11434',
                 'WORKSPACE_BASE': '/workspace',
                 'TASK_DESCRIPTION': task_description,
                 'REPO_URL': session.repo_url,
                 'BRANCH': session.branch
             }
-            
-            # Run OpenHands container
+
+            extra_hosts = {'host.docker.internal': 'host-gateway'}
+
+            command = [
+                "python", "-m", "openhands.core.main", "-t", task_description
+            ]
+
             container = self.docker_client.containers.run(
-                f"docker.all-hands.dev/all-hands-ai/openhands:${OPENHANDS_VERSION}",
-                command=["python", "-m", "openhands.core.main", "-t", task_description],
+                openhands_image,
+                command=command,
                 name=container_name,
                 volumes=volumes,
                 environment=environment,
+                extra_hosts=extra_hosts,
                 detach=True,
                 remove=True,
                 auto_remove=True
             )
-            
+
             session.container_id = container.id
-            
-            # Wait for container to complete and get logs
+
             print(f"Starting OpenHands coding session for branch: {session.branch}")
             container.wait()
-            
             logs = container.logs(stdout=True, stderr=True).decode('utf-8')
-            
-            # Update session status
             session.status = "completed"
-            
             return logs
-            
+
         except DockerException as e:
             session.status = "failed"
             raise RuntimeError(f"Docker error during coding session: {e}")
