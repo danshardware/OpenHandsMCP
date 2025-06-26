@@ -275,9 +275,19 @@ class SessionManager:
 
             session.container_id = container.id
 
-            print(f"Starting OpenHands coding session for branch: {session.branch}")
-            container.wait()
+            logger.info(f"waiting for container: {container_name} ({container.id}) to finish...")
+            if container.status == 'running':
+                container.wait()
             logs = container.logs(stdout=True, stderr=True).decode('utf-8')
+            logger.info(f"Container {container_name} ({container.id}) finished")
+            logger.debug(f"Container {container_name} ({container.id}) logs:\n{logs}")
+            
+            # check the exit code
+            exit_code = container.attrs['State']['ExitCode']
+            if exit_code != 0:
+                logger.warning(f"Container {container_name} ({container.id}) exited with code {exit_code}")
+                session.status = "failed"
+                raise RuntimeError(f"Container exited with code {exit_code}. Logs:\n{logs}")
             session.status = "ok"
             return logs
 
