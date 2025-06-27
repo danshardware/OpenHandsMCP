@@ -1,10 +1,9 @@
 """Session management for OpenHands MCP server."""
 
-import asyncio
 import os
 import shutil
 import stat
-import tempfile
+import json
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -30,9 +29,12 @@ class SessionInfo(BaseModel):
     repo_url: str
     branch: str
     workspace_path: Path
-    container_id: Optional[str] = None
+    # Track multiple coding task containers per session
+    coding_task_containers: list = []  # List of dicts: [{"id": str, "status": str, "created_at": datetime}]
     created_at: datetime
     status: str = "active"
+    # Deprecated: container_id (for backward compatibility, can be removed later)
+    container_id: Optional[str] = None
 
 
 class SessionManager:
@@ -129,6 +131,50 @@ class SessionManager:
             logger.warning(f"Failed to import existing sessions: {e}")
             # Continue without existing sessions if import fails
             self.sessions = {}
+            
+    def _prepare_secrets_for_session(self, workspace_path: Path) -> Optional[str]:
+        """Prepare secrets file in workspace for sandbox container access."""
+        secrets_file = workspace_path / ".openhands_secrets"
+        
+        # Collect secrets from host environment (prefixed for security)
+        secrets = {}
+        for key, value in os.environ.items():
+            if key.startswith('OPENHANDS_SECRET_'):
+                # Strip prefix: OPENHANDS_SECRET_GITHUB_TOKEN -> GITHUB_TOKEN
+                secret_name = key[17:]  # Remove 'OPENHANDS_SECRET_' prefix
+                secrets[secret_name] = value
+        
+        if secrets:
+            # Write secrets as shell exports for easy sourcing
+            with open(secrets_file, 'w') as f:
+                f.write("#!/bin/bash\n")
+                f.write("# Auto-generated secrets file - DO NOT COMMIT\n")
+                for key, value in secrets.items():
+                    # Escape single quotes in values
+                    escaped_value = value.replace("'", "'\"'\"'")
+                    f.write(f"export {key}='{escaped_value}'\n")
+            
+            # Restrict file permissions (owner read-only)
+            os.chmod(secrets_file, 0o600)
+            
+            # Also create .gitignore entry to prevent committing secrets
+            gitignore_path = workspace_path / ".gitignore"
+            gitignore_entry = ".openhands_secrets\n"
+            
+            if gitignore_path.exists():
+                with open(gitignore_path, 'r') as f:
+                    content = f.read()
+                if gitignore_entry.strip() not in content:
+                    with open(gitignore_path, 'a') as f:
+                        f.write(gitignore_entry)
+            else:
+                with open(gitignore_path, 'w') as f:
+                    f.write(gitignore_entry)
+            
+            logger.info(f"Prepared {len(secrets)} secrets for workspace")
+            return str(secrets_file)
+        
+        return None
     
     def create_session(self, repo_url: str, branch: str = "main") -> str:
         """Create a new coding session."""
@@ -233,35 +279,47 @@ class SessionManager:
                 "error": str(e)
             }
     
-    async def start_coding_session(self, session_id: str, task_description: str) -> str:
-        """Start an OpenHands coding session"""
+    async def start_coding_session(self, session_id: str, task_description: str) -> dict:
+        """Start an OpenHands coding session (asynchronous, tracks multiple containers)."""
         session = self.get_session(session_id)
 
+        # Limit concurrent coding task containers per session
+        max_tasks = int(os.environ.get("OPENHANDS_MAX_TASKS", 3))
+        
+        # Remove finished containers from tracking
+        if self.docker_client:
+            still_running = []
+            for c in session.coding_task_containers:
+                try:
+                    container = self.docker_client.containers.get(c["id"])
+                    container.reload()
+                    if container.status in ("created", "running", "paused"):
+                        still_running.append(c)
+                except Exception:
+                    continue
+            session.coding_task_containers = still_running
+        if len(session.coding_task_containers) >= max_tasks:
+            return {"isError": True, "error": f"Max coding tasks ({max_tasks}) already running for this session."}
+
         if not self.docker_client:
-            raise RuntimeError("Docker client not available")
+            return {"isError": True, "error": "Docker client not available"}
 
         try:
+            # Prepare secrets file in workspace
+            secrets_file = self._prepare_secrets_for_session(session.workspace_path)
+            
             container_name = f"openhands-app-{datetime.now().strftime('%Y%m%d%H%M%S')}"
             user_home = str(Path.home())
-            # Try to get podman/docker socket path (Linux/WSL/Podman Desktop)
             xdg_runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
-            podman_sock = None
-            if xdg_runtime_dir:
-                podman_sock = os.path.join(xdg_runtime_dir, "podman/podman.sock")
-            else:
-                # Fallback for Windows/Mac: use default Docker socket
-                podman_sock = os.environ.get("DOCKER_HOST", "/var/run/docker.sock")
-
+            podman_sock = os.path.join(xdg_runtime_dir, "podman/podman.sock") if xdg_runtime_dir else os.environ.get("DOCKER_HOST", "/var/run/docker.sock")
             openhands_ver = os.environ.get("OPENHANDS_VER", "0.45")
             runtime_image = f"docker.all-hands.dev/all-hands-ai/runtime:{openhands_ver}-nikolaik"
             openhands_image = f"docker.all-hands.dev/all-hands-ai/openhands:{openhands_ver}"
-
             volumes = {
-                str(session.workspace_path.absolute()): {'bind': '/workspace', 'mode': 'rw'},
-                podman_sock: {'bind': '/var/run/docker.sock', 'mode': 'rw'},
-                os.path.join(user_home, ".openhands"): {'bind': '/.openhands', 'mode': 'rw'},
+                str(session.workspace_path.absolute()):{'bind': '/workspace', 'mode': 'rw'},
+                podman_sock:{'bind': '/var/run/docker.sock', 'mode': 'rw'},
+                os.path.join(user_home, ".openhands"):{'bind': '/.openhands', 'mode': 'rw'},
             }
-
             environment = {
                 'SANDBOX_RUNTIME_CONTAINER_IMAGE': runtime_image,
                 'SANDBOX_VOLUMES': f"{session.workspace_path.absolute()}:/workspace",
@@ -274,74 +332,46 @@ class SessionManager:
                 'REPO_URL': session.repo_url,
                 'BRANCH': session.branch
             }
-
-            extra_hosts = {'host.docker.internal': 'host-gateway'}
-
-            command = [
-                "python", "-m", "openhands.core.main", "-t", task_description
-            ]
-
-            logger.info(f"Starting OpenHands coding session on container: {container_name}")
-            try:
-                logger.debug(
-                    f"Starting container.\n"
-                    f"Image: {openhands_image}\n"
-                    f"Command: {command}\n"
-                    f"Name: {container_name}\n"
-                    f"Volumes: {volumes}\n"
-                    f"Environment: {environment}\n"
-                    f"Extra hosts: {extra_hosts}\n"
-                )
-                container = self.docker_client.containers.run(
-                    openhands_image,
-                    command=command,
-                    name=container_name,
-                    volumes=volumes,
-                    environment=environment,
-                    extra_hosts=extra_hosts,
-                    detach=True,
-                    auto_remove=False
-                )
-            except Exception as e:
-                logger.error(
-                    f"Failed to start container.\n"
-                    f"Image: {openhands_image}\n"
-                    f"Command: {command}\n"
-                    f"Name: {container_name}\n"
-                    f"Volumes: {volumes}\n"
-                    f"Environment: {environment}\n"
-                    f"Extra hosts: {extra_hosts}\n"
-                    f"Error: {e}"
-                )
-                raise
-
-            session.container_id = container.id
-            logger.debug(f"Container {container_name} ({container.id}) started successfully and is '{container.status}'")
-            await asyncio.sleep(1)  # Give Docker a moment to stabilize the container state
-            container.reload()  # Ensure we have the latest status
-            if container.status == 'running':
-                logger.info(f"waiting for container: {container_name} ({container.id}) to finish...")
-                container.wait()
-            logs = container.logs(stdout=True, stderr=True).decode('utf-8')
-            logger.info(f"Container {container_name} ({container.id}) finished")
-            logger.debug(f"Container {container_name} ({container.id}) logs:\n{logs}")
             
-            # check the exit code
-            exit_code = container.attrs['State']['ExitCode']
-            container.remove()
-            if exit_code != 0:
-                logger.warning(f"Container {container_name} ({container.id}) exited with code {exit_code}")
-                session.status = "failed"
-                raise RuntimeError(f"Container exited with code {exit_code}. Logs:\n{logs}")
-            session.status = "ok"
-            return logs
-
-        except DockerException as e:
-            session.status = "failed"
-            raise RuntimeError(f"Docker error during coding session: {e}")
+            # Add secrets configuration if secrets file exists
+            if secrets_file:
+                environment['OPENHANDS_SECRETS_FILE'] = '/workspace/.openhands_secrets'
+                # Tell OpenHands to source secrets in sandbox initialization
+                environment['SANDBOX_USER_DATA_FOLDER'] = '/workspace'
+                # Add startup command to source secrets
+                startup_cmd = f"[ -f /workspace/.openhands_secrets ] && source /workspace/.openhands_secrets; "
+                environment['SANDBOX_STARTUP_CMD'] = startup_cmd
+            
+            extra_hosts = {'host.docker.internal': 'host-gateway'}
+            command = ["python", "-m", "openhands.core.main", "-t", task_description]
+            
+            logger.info(f"Starting OpenHands coding session on container: {container_name}")
+            if secrets_file:
+                logger.info(f"Secrets file prepared at: {secrets_file}")
+            
+            container = self.docker_client.containers.run(
+                openhands_image,
+                command=command,
+                name=container_name,
+                volumes=volumes,
+                environment=environment,
+                extra_hosts=extra_hosts,
+                detach=True,
+                auto_remove=False
+            )
+            # Track the new container
+            session.coding_task_containers.append({
+                "id": container.id,
+                "name": container_name,
+                "created_at": datetime.now(),
+                "status": "created",
+                "task_description": task_description
+            })
+            logger.debug(f"Container {container_name} ({container.id}) started successfully.")
+            return {"isError": False, "container": container.id}
         except Exception as e:
-            session.status = "failed"
-            raise RuntimeError(f"Failed to start coding session: {e}")
+            logger.error(f"Failed to start coding task container: {e}")
+            return {"isError": True, "error": str(e)}
     
     def teardown_session(self, session_id: str, archive_changes: bool = True) -> dict:
         """Teardown a coding session."""
@@ -401,3 +431,55 @@ class SessionManager:
     def list_sessions(self) -> Dict[str, SessionInfo]:
         """List all active sessions."""
         return self.sessions.copy()
+    
+    def get_coding_task_status(self, session_id: str) -> dict:
+        """Return status and logs for all coding task containers in a session."""
+        session = self.get_session(session_id)
+        results = []
+        if not self.docker_client:
+            return {"isError": True, "error": "Docker client not available"}
+        for c in session.coding_task_containers:
+            try:
+                container = self.docker_client.containers.get(c["id"])
+                container.reload()
+                status = container.status
+                try:
+                    logs = container.logs(stdout=True, stderr=True, tail=1000).decode('utf-8')
+                except Exception:
+                    logs = ""
+                results.append({
+                    "id": c["id"],
+                    "name": c.get("name"),
+                    "status": status,
+                    "created_at": str(c.get("created_at")),
+                    "task_description": c.get("task_description"),
+                    "logs": logs
+                })
+            except Exception as e:
+                results.append({
+                    "id": c["id"],
+                    "name": c.get("name"),
+                    "status": "unknown",
+                    "created_at": str(c.get("created_at")),
+                    "task_description": c.get("task_description"),
+                    "logs": "",
+                    "error": str(e)
+                })
+        return {"isError": False, "tasks": results}
+    
+    def cleanup_coding_tasks(self, session_id: str) -> dict:
+        """Stop and remove all coding task containers for a session."""
+        session = self.get_session(session_id)
+        if not self.docker_client:
+            return {"isError": True, "error": "Docker client not available"}
+        results = []
+        for c in session.coding_task_containers:
+            try:
+                container = self.docker_client.containers.get(c["id"])
+                container.stop()
+                container.remove()
+                results.append({"id": c["id"], "status": "removed"})
+            except Exception as e:
+                results.append({"id": c["id"], "status": "error", "error": str(e)})
+        session.coding_task_containers = []
+        return {"isError": False, "results": results}

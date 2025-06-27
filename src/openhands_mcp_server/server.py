@@ -46,7 +46,7 @@ def start_session(repo_url: str, branch: str = "main") -> dict:
 
 @mcp.tool()
 async def code(session_id: str, task_description: str) -> dict:
-    """Start a coding session with OpenHands AI agent. Use this tool for any commands that require executing any commands in the session workspace."""
+    """Start a coding session with OpenHands AI agent. Launches a coding task container and returns its ID immediately."""
     if not session_manager.session_exists(session_id):
         return {
             "success": False,
@@ -54,13 +54,20 @@ async def code(session_id: str, task_description: str) -> dict:
             "error": "Session not found",
             "session_id": session_id
         }
-    logs = await session_manager.start_coding_session(session_id, task_description)
+    result = await session_manager.start_coding_session(session_id, task_description)
+    if result.get("isError"):
+        return {
+            "success": False,
+            "isError": True,
+            "session_id": session_id,
+            "error": result.get("error")
+        }
     return {
         "success": True,
         "isError": False,
         "session_id": session_id,
         "task_description": task_description,
-        "text": logs
+        "container": result.get("container")
     }
 
 @mcp.tool()
@@ -78,6 +85,42 @@ def teardown(session_id: str, archive_changes: bool = True) -> dict:
     """Clean up a coding session, removing containers and directories."""
     result = session_manager.teardown_session(session_id, archive_changes)
     return {
+        "session_id": session_id,
+        **result
+    }
+
+@mcp.tool()
+def coding_task_status(session_id: str) -> dict:
+    """Get status and logs for all coding task containers in a session."""
+    if not session_manager.session_exists(session_id):
+        return {
+            "success": False,
+            "isError": True,
+            "error": "Session not found",
+            "session_id": session_id
+        }
+    result = session_manager.get_coding_task_status(session_id)
+    return {
+        "success": not result.get("isError", False),
+        "isError": result.get("isError", False),
+        "session_id": session_id,
+        **result
+    }
+
+@mcp.tool()
+def cleanup_coding_tasks(session_id: str) -> dict:
+    """Stop and remove all coding task containers for a session."""
+    if not session_manager.session_exists(session_id):
+        return {
+            "success": False,
+            "isError": True,
+            "error": "Session not found",
+            "session_id": session_id
+        }
+    result = session_manager.cleanup_coding_tasks(session_id)
+    return {
+        "success": not result.get("isError", False),
+        "isError": result.get("isError", False),
         "session_id": session_id,
         **result
     }
