@@ -72,6 +72,26 @@ class SessionManager:
                 except ValueError:
                     continue
 
+    def _get_docker_host(self):
+        # 1. Use DOCKER_HOST if set
+        docker_host = os.environ.get("DOCKER_HOST")
+        if docker_host:
+            return docker_host
+        # 2. Try default Unix sockets in order
+        candidates = [
+            "/var/run/docker.sock",
+            "/var/run/podman.sock",
+        ]
+        xdg_runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+        if xdg_runtime_dir:
+            candidates.append(os.path.join(xdg_runtime_dir, "podman/podman.sock"))
+        for sock in candidates:
+            if os.path.exists(sock) and os.access(sock, os.W_OK):
+                logger.debug(f"Using Docker socket: {sock}")
+                return f"unix://{sock}"
+        logger.warning("No valid Docker socket found. Using default settings.")
+        return None
+
     def __init__(self, sessions_dir: str = "./sessions", archive_dir: str = "./archive"):
         self.sessions_dir = Path(sessions_dir)
         self.archive_dir = Path(archive_dir)
@@ -82,9 +102,23 @@ class SessionManager:
         self.sessions_dir.mkdir(exist_ok=True)
         self.archive_dir.mkdir(exist_ok=True)
         
-        # Initialize Docker client
+        # Initialize Docker client with robust socket detection
         try:
-            self.docker_client = docker.from_env()
+            docker_host = self._get_docker_host()
+            if docker_host:
+                # Temporarily override DOCKER_HOST for docker.from_env
+                old_docker_host = os.environ.get("DOCKER_HOST")
+                os.environ["DOCKER_HOST"] = docker_host
+                try:
+                    self.docker_client = docker.from_env()
+                finally:
+                    # Restore previous DOCKER_HOST if it was not set
+                    if old_docker_host is None:
+                        del os.environ["DOCKER_HOST"]
+                    else:
+                        os.environ["DOCKER_HOST"] = old_docker_host
+            else:
+                self.docker_client = docker.from_env()
         except DockerException as e:
             logger.warning(f"Could not connect to Docker: {e}")
             self.docker_client = None
@@ -230,7 +264,7 @@ class SessionManager:
 
             environment = {
                 'SANDBOX_RUNTIME_CONTAINER_IMAGE': runtime_image,
-                'SANDBOX_VOLUMES': f"{session.workspace_path.absolute()}: /workspace",
+                'SANDBOX_VOLUMES': f"{session.workspace_path.absolute()}:/workspace",
                 'LLM_API_KEY': 'ollama',
                 'LLM_MODEL': 'ollama/devstral:latest',
                 'LOG_ALL_EVENTS': 'true',
@@ -249,6 +283,15 @@ class SessionManager:
 
             logger.info(f"Starting OpenHands coding session on container: {container_name}")
             try:
+                logger.debug(
+                    f"Starting container.\n"
+                    f"Image: {openhands_image}\n"
+                    f"Command: {command}\n"
+                    f"Name: {container_name}\n"
+                    f"Volumes: {volumes}\n"
+                    f"Environment: {environment}\n"
+                    f"Extra hosts: {extra_hosts}\n"
+                )
                 container = self.docker_client.containers.run(
                     openhands_image,
                     command=command,
@@ -257,8 +300,7 @@ class SessionManager:
                     environment=environment,
                     extra_hosts=extra_hosts,
                     detach=True,
-                    remove=True,
-                    auto_remove=True
+                    auto_remove=False
                 )
             except Exception as e:
                 logger.error(
@@ -274,9 +316,11 @@ class SessionManager:
                 raise
 
             session.container_id = container.id
-
-            logger.info(f"waiting for container: {container_name} ({container.id}) to finish...")
+            logger.debug(f"Container {container_name} ({container.id}) started successfully and is '{container.status}'")
+            await asyncio.sleep(1)  # Give Docker a moment to stabilize the container state
+            container.reload()  # Ensure we have the latest status
             if container.status == 'running':
+                logger.info(f"waiting for container: {container_name} ({container.id}) to finish...")
                 container.wait()
             logs = container.logs(stdout=True, stderr=True).decode('utf-8')
             logger.info(f"Container {container_name} ({container.id}) finished")
@@ -284,6 +328,7 @@ class SessionManager:
             
             # check the exit code
             exit_code = container.attrs['State']['ExitCode']
+            container.remove()
             if exit_code != 0:
                 logger.warning(f"Container {container_name} ({container.id}) exited with code {exit_code}")
                 session.status = "failed"

@@ -2,15 +2,12 @@
 """Launcher script for OpenHands MCP Server."""
 
 import sys
-import asyncio
 import argparse
 from pathlib import Path
+import os
 
 # Add the src directory to the Python path
 sys.path.insert(0, str(Path(__file__).parent / "src"))
-
-from src.openhands_mcp_server.server import main
-
 
 def parse_args():
     """Parse command line arguments."""
@@ -34,6 +31,19 @@ def parse_args():
         help="Set the logging level (default: INFO)"
     )
     
+    parser.add_argument(
+        "--host",
+        default="localhost",
+        help="What host to bind to (default: localhost)"
+    )
+    
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=6363,
+        help="Port to run the server on (default: 6363)"
+    )
+    
     return parser.parse_args()
 
 
@@ -43,6 +53,10 @@ if __name__ == "__main__":
     # Set up logging level
     import logging
     logging.basicConfig(level=getattr(logging, args.log_level))
+    from src.openhands_mcp_server.server import main
+    
+    os.environ["MCP_HTTP_HOST"] = args.host
+    os.environ["MCP_HTTP_PORT"] = str(args.port)
     
     print(f"Starting OpenHands MCP Server...")
     print(f"Sessions directory: {args.sessions_dir}")
