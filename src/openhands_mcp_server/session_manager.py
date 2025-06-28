@@ -1,6 +1,7 @@
 """Session management for OpenHands MCP server."""
 
 import os
+import shlex
 import shutil
 import stat
 import json
@@ -239,8 +240,17 @@ class SessionManager:
         try:
             repo = git.Repo(session.workspace_path)
             
-            # Use getattr to call git commands dynamically
-            command_parts = command.split()
+            # Use shlex to properly parse quoted arguments
+            try:
+                command_parts = shlex.split(command)
+            except ValueError as e:
+                return {
+                    "success": False,
+                    "isError": True,
+                    "output": "",
+                    "error": f"Invalid command syntax: {e}"
+                }
+            
             if command_parts[0] == "git":
                 command_parts = command_parts[1:]
             
@@ -327,6 +337,7 @@ class SessionManager:
                 'LLM_MODEL': 'ollama/devstral:latest',
                 'LOG_ALL_EVENTS': 'true',
                 'LLM_BASE_URL': 'http://host.docker.internal:11434',
+                'LLM_TIMEOUT': '900',
                 'WORKSPACE_BASE': '/workspace',
                 'TASK_DESCRIPTION': task_description,
                 'REPO_URL': session.repo_url,
